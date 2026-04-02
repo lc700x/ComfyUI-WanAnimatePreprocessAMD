@@ -4,57 +4,98 @@ import cv2
 import numpy as np
 import torch
 import onnxruntime
+import threading
 
 from ..pose_utils.pose2d_utils import box_convert_simple, keypoints_from_heatmaps
 
+
 class SimpleOnnxInference(object):
-    def __init__(self, checkpoint, device='CUDAExecutionProvider', **kwargs):
-        # Store initialization parameters for potential reinit
+    """
+    Thread-safe ONNX inference wrapper.
+
+    Uses:
+    - per-thread sessions
+    - session lifecycle lock
+    """
+
+    def __init__(self, checkpoint, device='CPUExecutionProvider', **kwargs):
         self.checkpoint = checkpoint
         self.init_kwargs = kwargs
-        provider = [device, 'CPUExecutionProvider'] if device == 'CUDAExecutionProvider' else [device]
+
+        if device != "CPUExecutionProvider":
+            provider = [device, "CPUExecutionProvider"]
+        else:
+            provider = ["CPUExecutionProvider"]
 
         self.provider = provider
-        self.session = onnxruntime.InferenceSession(checkpoint, providers=provider)
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-        self.input_resolution = self.session.get_inputs()[0].shape[2:]
-        self.input_resolution = np.array(self.input_resolution)
+
+        self._session_lock = threading.RLock()
+        self._thread_local = threading.local()
+
+        self._create_base_session()
+
+    def _create_base_session(self):
+        with self._session_lock:
+            self.session = onnxruntime.InferenceSession(
+                self.checkpoint,
+                providers=self.provider,
+            )
+
+            self.input_name = self.session.get_inputs()[0].name
+            self.output_name = self.session.get_outputs()[0].name
+            self.input_resolution = np.array(self.session.get_inputs()[0].shape[2:])
+
+    def _get_session(self):
+        if not hasattr(self._thread_local, "session"):
+            with self._session_lock:
+                self._thread_local.session = onnxruntime.InferenceSession(
+                    self.checkpoint,
+                    providers=self.provider,
+                )
+        return self._thread_local.session
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
     def get_output_names(self):
-        output_names = []
-        for node in self.session.get_outputs():
-            output_names.append(node.name)
-        return output_names
+        session = self._get_session()
+        return [node.name for node in session.get_outputs()]
 
     def cleanup(self):
-        if hasattr(self, 'session') and self.session is not None:
-            # Close the ONNX Runtime session
-            del self.session
-            self.session = None
+        with self._session_lock:
+            if hasattr(self, "session") and self.session is not None:
+                del self.session
+                self.session = None
+
+            if hasattr(self._thread_local, "session"):
+                del self._thread_local.session
 
     def reinit(self, provider=None):
-        # Use provided provider or fall back to original provider
-        if provider is not None:
-            self.provider = provider
+        with self._session_lock:
+            if provider is not None:
+                self.provider = provider
 
-        if self.session is None:
-            checkpoint = self.checkpoint
-            self.session = onnxruntime.InferenceSession(checkpoint, providers=self.provider)
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_name = self.session.get_outputs()[0].name
-            self.input_resolution = self.session.get_inputs()[0].shape[2:]
-            self.input_resolution = np.array(self.input_resolution)
+            self.cleanup()
+            self._create_base_session()
+
 
 class Yolo(SimpleOnnxInference):
-    def __init__(self, checkpoint, device='cuda', threshold_conf=0.05, threshold_multi_persons=0.1, input_resolution=(640, 640), threshold_iou=0.5, threshold_bbox_shape_ratio=0.4, cat_id=[1], select_type='max', strict=True, sorted_func=None, **kwargs):
-        super(Yolo, self).__init__(checkpoint, device=device, **kwargs)
-
-        model_inputs = self.session.get_inputs()
-        input_shape = model_inputs[0].shape
+    def __init__(
+        self,
+        checkpoint,
+        device='CPUExecutionProvider',
+        threshold_conf=0.05,
+        threshold_multi_persons=0.1,
+        input_resolution=(640, 640),
+        threshold_iou=0.5,
+        threshold_bbox_shape_ratio=0.4,
+        cat_id=[1],
+        select_type='max',
+        strict=True,
+        sorted_func=None,
+        **kwargs
+    ):
+        super().__init__(checkpoint, device=device, **kwargs)
 
         self.input_width = 640
         self.input_height = 640
@@ -69,38 +110,17 @@ class Yolo(SimpleOnnxInference):
         self.strict = strict
         self.sorted_func = sorted_func
 
-
-
     def postprocess(self, output, shape_raw, cat_id=[1]):
-        """
-        Performs post-processing on the model's output to extract bounding boxes, scores, and class IDs.
-
-        Args:
-            input_image (numpy.ndarray): The input image.
-            output (numpy.ndarray): The output of the model.
-
-        Returns:
-            numpy.ndarray: The input image with detections drawn on it.
-        """
-        # Transpose and squeeze the output to match the expected shape
-
         outputs = np.squeeze(output)
+
         if len(outputs.shape) == 1:
             outputs = outputs[None]
+
         if output.shape[-1] != 6 and output.shape[1] == 84:
             outputs = np.transpose(outputs)
 
-        # Get the number of rows in the outputs array
-        rows = outputs.shape[0]
-
-        # Calculate the scaling factors for the bounding box coordinates
         x_factor = shape_raw[1] / self.input_width
         y_factor = shape_raw[0] / self.input_height
-
-        # Lists to store the bounding boxes, scores, and class IDs of the detections
-        boxes = []
-        scores = []
-        class_ids = []
 
         if outputs.shape[-1] == 6:
             max_scores = outputs[:, 4]
@@ -125,8 +145,7 @@ class Yolo(SimpleOnnxInference):
             threshold_conf_masks = max_scores >= self.threshold_conf
 
             classid = np.argmax(classes_scores[threshold_conf_masks], -1)
-
-            classid_masks = classid!=3.14159
+            classid_masks = classid != 3.14159
 
             classes_scores = classes_scores[threshold_conf_masks][classid_masks]
             max_scores = max_scores[threshold_conf_masks][classid_masks]
@@ -149,22 +168,29 @@ class Yolo(SimpleOnnxInference):
         scores = max_scores.tolist()
         class_ids = classid.tolist()
 
-        # Apply non-maximum suppression to filter out overlapping bounding boxes
-        indices = cv2.dnn.NMSBoxes(boxes, scores, self.threshold_conf, self.threshold_iou)
-        # Iterate over the selected indices after non-maximum suppression
+        if len(boxes) == 0:
+            return np.empty((0, 6), dtype=np.float32)
+
+        indices = cv2.dnn.NMSBoxes(
+            boxes,
+            scores,
+            self.threshold_conf,
+            self.threshold_iou,
+        )
+
+        if indices is None or len(indices) == 0:
+            return np.empty((0, 6), dtype=np.float32)
+
+        indices = np.array(indices).reshape(-1).tolist()
 
         results = []
         for i in indices:
-            # Get the box, score, and class ID corresponding to the index
             box = box_convert_simple(boxes[i], 'xywh2xyxy')
             score = scores[i]
             class_id = class_ids[i]
             results.append(box + [score] + [class_id])
-            # # Draw the detection on the input image
 
-        # Return the modified input image
-        return np.array(results)
-
+        return np.array(results, dtype=np.float32)
 
     def process_results(self, results, shape_raw, cat_id=[1], single_person=True):
         if isinstance(results, tuple):
@@ -174,73 +200,86 @@ class Yolo(SimpleOnnxInference):
 
         person_results = []
         person_count = 0
-        if len(results):
-            max_idx = -1
-            max_bbox_size = shape_raw[0] * shape_raw[1] * -10
-            max_bbox_shape = -1
 
-            bboxes = []
-            idx_list = []
-            for i in range(results.shape[0]):
-                bbox = results[i]
-                if (bbox[-1] + 1 in cat_id) and (bbox[-2] > self.threshold_conf):
-                    idx_list.append(i)
-                    bbox_shape = max((bbox[2] - bbox[0]), ((bbox[3] - bbox[1])))
-                    if bbox_shape > max_bbox_shape:
-                        max_bbox_shape = bbox_shape
+        if det_results is None or len(det_results) == 0:
+            return None
 
-            results = results[idx_list]
+        max_idx = -1
+        max_bbox_size = shape_raw[0] * shape_raw[1] * -10
+        max_bbox_shape = -1
 
-            for i in range(results.shape[0]):
-                bbox = results[i]
-                bboxes.append(bbox)
+        bboxes = []
+        idx_list = []
+
+        for i in range(det_results.shape[0]):
+            bbox = det_results[i]
+            if (bbox[-1] + 1 in cat_id) and (bbox[-2] > self.threshold_conf):
+                idx_list.append(i)
+                bbox_shape = max((bbox[2] - bbox[0]), (bbox[3] - bbox[1]))
+                if bbox_shape > max_bbox_shape:
+                    max_bbox_shape = bbox_shape
+
+        if len(idx_list) == 0:
+            return None
+
+        det_results = det_results[idx_list]
+
+        for i in range(det_results.shape[0]):
+            bbox = det_results[i]
+            bboxes.append(bbox)
+
+            if self.select_type == 'max':
+                bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
+            elif self.select_type == 'center':
+                bbox_size = (abs((bbox[2] + bbox[0]) / 2 - shape_raw[1] / 2)) * -1
+            else:
+                bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
+
+            bbox_shape = max((bbox[2] - bbox[0]), ((bbox[3] - bbox[1])))
+
+            if bbox_size > max_bbox_size:
+                if (self.strict or max_idx != -1) and bbox_shape < max_bbox_shape * self.threshold_bbox_shape_ratio:
+                    continue
+                max_bbox_size = bbox_size
+                max_bbox_shape = bbox_shape
+                max_idx = i
+
+        if self.sorted_func is not None and len(bboxes) > 0:
+            max_idx = self.sorted_func(bboxes, shape_raw)
+            bbox = bboxes[max_idx]
+            if self.select_type == 'max':
+                max_bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
+            elif self.select_type == 'center':
+                max_bbox_size = (abs((bbox[2] + bbox[0]) / 2 - shape_raw[1] / 2)) * -1
+
+        if max_idx != -1:
+            person_count = 1
+
+        if max_idx != -1:
+            person = {}
+            person['bbox'] = det_results[max_idx, :5]
+            person['track_id'] = int(0)
+            person_results.append(person)
+
+        for i in range(det_results.shape[0]):
+            bbox = det_results[i]
+            if (bbox[-1] + 1 in cat_id) and (bbox[-2] > self.threshold_conf):
                 if self.select_type == 'max':
                     bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
                 elif self.select_type == 'center':
-                    bbox_size = (abs((bbox[2] + bbox[0]) / 2 - shape_raw[1]/2)) * -1
-                bbox_shape = max((bbox[2] - bbox[0]), ((bbox[3] - bbox[1])))
-                if bbox_size > max_bbox_size:
-                    if (self.strict or max_idx != -1) and bbox_shape < max_bbox_shape * self.threshold_bbox_shape_ratio:
-                        continue
-                    max_bbox_size = bbox_size
-                    max_bbox_shape = bbox_shape
-                    max_idx = i
+                    bbox_size = (abs((bbox[2] + bbox[0]) / 2 - shape_raw[1] / 2)) * -1
+                else:
+                    bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
 
-            if self.sorted_func is not None and len(bboxes) > 0:
-                max_idx = self.sorted_func(bboxes, shape_raw)
-                bbox = bboxes[max_idx]
-                if self.select_type == 'max':
-                    max_bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
-                elif self.select_type == 'center':
-                    max_bbox_size = (abs((bbox[2] + bbox[0]) / 2 - shape_raw[1]/2)) * -1
+                if i != max_idx and bbox_size > max_bbox_size * self.threshold_multi_persons and bbox_size < max_bbox_size:
+                    person_count += 1
+                    if not single_person:
+                        person = {}
+                        person['bbox'] = det_results[i, :5]
+                        person['track_id'] = int(person_count - 1)
+                        person_results.append(person)
 
-            if max_idx != -1:
-                person_count = 1
-
-            if max_idx != -1:
-                person = {}
-                person['bbox'] = results[max_idx, :5]
-                person['track_id'] = int(0)
-                person_results.append(person)
-
-            for i in range(results.shape[0]):
-                bbox = results[i]
-                if (bbox[-1] + 1 in cat_id) and (bbox[-2] > self.threshold_conf):
-                    if self.select_type == 'max':
-                        bbox_size = (bbox[2] - bbox[0]) * ((bbox[3] - bbox[1]))
-                    elif self.select_type == 'center':
-                        bbox_size = (abs((bbox[2] + bbox[0]) / 2 - shape_raw[1]/2)) * -1
-                    if i != max_idx and bbox_size > max_bbox_size * self.threshold_multi_persons and bbox_size < max_bbox_size:
-                        person_count += 1
-                        if not single_person:
-                            person = {}
-                            person['bbox'] = results[i, :5]
-                            person['track_id'] = int(person_count - 1)
-                            person_results.append(person)
-            return person_results
-        else:
-            return None
-
+        return person_results if len(person_results) > 0 else None
 
     def postprocess_threading(self, outputs, shape_raw, person_results, i, single_person=True, **kwargs):
         result = self.postprocess(outputs[i], shape_raw[i], cat_id=self.cat_id)
@@ -248,35 +287,62 @@ class Yolo(SimpleOnnxInference):
         if result is not None and len(result) != 0:
             person_results[i] = result
 
-
     def forward(self, img, shape_raw, **kwargs):
-        """
-        Performs inference using an ONNX model and returns the output image with drawn detections.
-
-        Returns:
-            output_img: The output image with drawn detections.
-        """
         if isinstance(img, torch.Tensor):
             img = img.cpu().numpy()
             shape_raw = shape_raw.cpu().numpy()
 
-        outputs = self.session.run(None, {self.session.get_inputs()[0].name: img})[0]
-        person_results = [[{'bbox': np.array([0., 0., 1.*shape_raw[i][1], 1.*shape_raw[i][0], -1]), 'track_id': -1}] for i in range(len(outputs))]
+        session = self._get_session()
+
+        outputs = session.run(
+            None,
+            {session.get_inputs()[0].name: img}
+        )[0]
+
+        person_results = [
+            [{
+                'bbox': np.array([
+                    0.,
+                    0.,
+                    1. * shape_raw[i][1],
+                    1. * shape_raw[i][0],
+                    -1
+                ]),
+                'track_id': -1
+            }]
+            for i in range(len(outputs))
+        ]
 
         for i in range(len(outputs)):
-            self.postprocess_threading(outputs, shape_raw, person_results, i, **kwargs)
+            self.postprocess_threading(
+                outputs,
+                shape_raw,
+                person_results,
+                i,
+                **kwargs
+            )
+
         return person_results
 
 
 class ViTPose(SimpleOnnxInference):
-    def __init__(self, checkpoint, device='cuda', **kwargs):
-        super(ViTPose, self).__init__(checkpoint, device=device)
+    def __init__(self, checkpoint, device='CPUExecutionProvider', **kwargs):
+        super().__init__(checkpoint, device=device)
 
     def forward(self, img, center, scale, **kwargs):
-        heatmaps = self.session.run([], {self.session.get_inputs()[0].name: img})[0]
-        points, prob = keypoints_from_heatmaps(heatmaps=heatmaps,
-                                            center=center,
-                                            scale=scale*200,
-                                            unbiased=True,
-                                            use_udp=False)
+        session = self._get_session()
+
+        heatmaps = session.run(
+            [],
+            {session.get_inputs()[0].name: img}
+        )[0]
+
+        points, prob = keypoints_from_heatmaps(
+            heatmaps=heatmaps,
+            center=center,
+            scale=scale * 200,
+            unbiased=True,
+            use_udp=False
+        )
+
         return np.concatenate([points, prob], axis=2)
