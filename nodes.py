@@ -21,6 +21,9 @@ from .utils import get_face_bboxes, padding_resize, resize_by_area, resize_to_bo
 from .pose_utils.human_visualization import AAPoseMeta, draw_aapose_by_meta_new
 from .retarget_pose import get_retarget_pose
 
+import onnxruntime as ort
+providers = ort.get_available_providers()
+
 class OnnxDetectionModelLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -28,7 +31,7 @@ class OnnxDetectionModelLoader:
             "required": {
                 "vitpose_model": (folder_paths.get_filename_list("detection"), {"tooltip": "These models are loaded from the 'ComfyUI/models/detection' -folder",}),
                 "yolo_model": (folder_paths.get_filename_list("detection"), {"tooltip": "These models are loaded from the 'ComfyUI/models/detection' -folder",}),
-                "onnx_device": (["CUDAExecutionProvider", "CPUExecutionProvider", "DmlExecutionProvider"], {"default": "CUDAExecutionProvider", "tooltip": "Device to run the ONNX models on"}),
+                "onnx_device": (providers, {"default": providers[0] if providers else "CPUExecutionProvider", "tooltip": "Device to run the ONNX models on"}),
             },
         }
 
